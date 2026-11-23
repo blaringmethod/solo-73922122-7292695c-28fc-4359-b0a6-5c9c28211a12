@@ -32,6 +32,13 @@ def create_app(db_path: str | None = None) -> Flask:
         flash(f"操作失败，已沿用原有数据与版本：{exc}", "error")
         return redirect(request.referrer or url_for("index"))
 
+    def backfill_note(summary: dict) -> str:
+        backfilled = summary.get("backfilled") or {}
+        if not backfilled:
+            return ""
+        parts = [f"《{name}》补录 {n} 条" for name, n in backfilled.items()]
+        return "；旧库补录：" + "、".join(parts)
+
     app.register_error_handler(ServiceError, handle_error)
 
     # ---------------- 首页概览 ----------------
@@ -66,9 +73,31 @@ def create_app(db_path: str | None = None) -> Flask:
             raise ServiceError("请选择文件")
         summary = svc().replace_volumes(f.read())
         if summary.get("created"):
-            flash(f"总册已更新为 {summary['total']} 个卷号，重算出版本 #{summary['version_id']}", "ok")
+            flash(f"总册已更新为 {summary['total']} 个卷号，重算出版本 "
+                  f"#{summary['version_id']}{backfill_note(summary)}", "ok")
         else:
-            flash(f"总册已保存 {summary['total']} 个卷号；登记规则后才会生成结论版本", "ok")
+            flash(f"总册已保存 {summary['total']} 个卷号；登记规则后才会生成结论版本"
+                  f"{backfill_note(summary)}", "ok")
+        return redirect(url_for("volumes"))
+
+    @app.route("/volumes/remove", methods=["POST"])
+    def volumes_remove():
+        summary = svc().remove_volume(request.form.get("volume_no", ""))
+        if summary.get("created"):
+            flash(f"卷号已移出总册，名单条目原样保留；重算出版本 "
+                  f"#{summary['version_id']}{backfill_note(summary)}", "ok")
+        else:
+            flash("卷号已移出总册，名单条目原样保留；规则或总册缺失，暂未生成版本", "ok")
+        return redirect(url_for("volumes"))
+
+    @app.route("/volumes/add", methods=["POST"])
+    def volumes_add():
+        summary = svc().add_volume(request.form.get("volume_no", ""))
+        if summary.get("created"):
+            flash(f"卷号已补回总册，按分馆最近一次提交的名单判定；重算出版本 "
+                  f"#{summary['version_id']}{backfill_note(summary)}", "ok")
+        else:
+            flash("卷号已补回总册；规则或总册缺失，暂未生成版本", "ok")
         return redirect(url_for("volumes"))
 
     # ---------------- 名单来源 ----------------

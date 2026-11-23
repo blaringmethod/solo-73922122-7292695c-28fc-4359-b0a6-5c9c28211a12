@@ -209,18 +209,41 @@ def test_definite_out_and_scan_kind(client, svc):
         conn.close()
 
 
-def test_replace_volumes_cleans_dangling_entries(client, svc):
+def test_replace_volumes_keeps_offbook_entries_for_restore(client, svc):
+    """换册不再删除离册条目：V2 离册期间条目保留，补回后按最近提交的名单判定。"""
     upload(client, "/volumes/upload", ["V1", "V2"])
     client.post("/lists/register", data={"name": "甲馆", "kind": "scan"})
     client.post("/rules/save", data={"rule": '{"并":["甲馆"]}'})
     upload(client, "/lists/1/upload", ["V1", "V2"])
-    # 总册替换为不含 V2 的新集合
+    # 总册替换为不含 V2 的新集合：list_entry 中的 V2 必须保留
     upload(client, "/volumes/upload", ["V1", "V3"])
     conn = svc._conn()
     try:
         entries = {r["volume_no"] for r in conn.execute(
             "SELECT volume_no FROM list_entry WHERE list_id = 1")}
-        assert entries == {"V1"}
+        assert entries == {"V1", "V2"}  # 旧实现会删掉 V2
+        row = svc.list_sources(conn)[0]
+        assert row["n_entries"] == 1          # 名单页只统计在册卷号
+        assert row["n_retained"] == 1         # V2 作为离册保留条目单列
+        # 新版本只发布在册卷号
+        vid = svc.current_version_id(conn)
+        items = {r["volume_no"] for r in conn.execute(
+            "SELECT volume_no FROM result_item WHERE version_id = ?", (vid,))}
+        assert items == {"V1", "V3"}
+    finally:
+        conn.close()
+
+    # 补回 V2：按甲馆最近一次提交（含 V2）判定，应重新确定入选
+    rv = client.post("/volumes/add", data={"volume_no": "V2"}, follow_redirects=True)
+    assert rv.status_code == 200
+    conn = svc._conn()
+    try:
+        vid = svc.current_version_id(conn)
+        verdicts = {r["volume_no"]: r["verdict"]
+                    for r in svc.result_page(conn, vid, None, 100, 0)}
+        assert verdicts == {"V1": "in", "V2": "in", "V3": "out"}
+        row = svc.list_sources(conn)[0]
+        assert row["n_entries"] == 2 and row["n_retained"] == 0
     finally:
         conn.close()
 
@@ -314,3 +337,304 @@ def test_50k_volumes_performance(tmp_path):
     finally:
         conn.close()
     assert elapsed < 30, f"重算过慢：{elapsed:.1f}s"
+
+
+# ------------------------------------------------- 移出 / 补回（本次修复主线）
+
+def test_remove_and_restore_volume_web_demo(client, svc):
+    """网页演示：确定入选卷移出后不在新版发布，补回后按最近名单重新入选。"""
+    upload(client, "/volumes/upload", ["V1", "V2", "V3"])
+    client.post("/lists/register", data={"name": "甲馆", "kind": "accept"})
+    client.post("/rules/save", data={"rule": '"甲馆"'})
+    upload(client, "/lists/1/upload", ["V1", "V2"])
+    conn = svc._conn()
+    try:
+        vid_before = svc.current_version_id(conn)
+        old_csv = svc.csv_for_version(vid_before, only_in=True)
+    finally:
+        conn.close()
+
+    # 网页移出 V2
+    rv = client.post("/volumes/remove", data={"volume_no": "V2"}, follow_redirects=True)
+    assert rv.status_code == 200 and "移出" in rv.text
+    conn = svc._conn()
+    try:
+        vid_off = svc.current_version_id(conn)
+        assert vid_off > vid_before
+        # 新版只发布在册卷号，V2 不在结果项中
+        items = {r["volume_no"] for r in conn.execute(
+            "SELECT volume_no FROM result_item WHERE version_id = ?", (vid_off,))}
+        assert items == {"V1", "V3"}
+        # 名单条目原样保留
+        assert {r["volume_no"] for r in conn.execute(
+            "SELECT volume_no FROM list_entry WHERE list_id = 1")} == {"V1", "V2"}
+        # 已发版本的 CSV 仍按原样下载
+        assert svc.csv_for_version(vid_before, only_in=True) == old_csv
+    finally:
+        conn.close()
+
+    # 网页补回 V2：按甲馆最近一次提交判定，恢复确定入选
+    rv = client.post("/volumes/add", data={"volume_no": "V2"}, follow_redirects=True)
+    assert rv.status_code == 200
+    conn = svc._conn()
+    try:
+        vid_back = svc.current_version_id(conn)
+        verdicts = {r["volume_no"]: r["verdict"]
+                    for r in svc.result_page(conn, vid_back, None, 100, 0)}
+        assert verdicts == {"V1": "in", "V2": "in", "V3": "out"}
+        # 历史版本依旧原样可下载
+        assert svc.csv_for_version(vid_before, only_in=True) == old_csv
+        off_csv = svc.csv_for_version(vid_off, only_in=True)
+        assert "V1" in off_csv and "V2" not in off_csv  # 离册版只发布在册的入选卷号
+    finally:
+        conn.close()
+
+
+def test_remove_rejects_unknown_and_add_rejects_duplicate(client, svc):
+    upload(client, "/volumes/upload", ["V1"])
+    rv = client.post("/volumes/remove", data={"volume_no": "NOPE"}, follow_redirects=True)
+    assert "不在总册内" in rv.text
+    rv = client.post("/volumes/add", data={"volume_no": "V1"}, follow_redirects=True)
+    assert "已在总册内" in rv.text
+
+
+def test_offbook_reupload_new_list_governs_on_restore(client, svc):
+    """离册期间分馆提交新名单：补回时以新名单为准（含空名单）。"""
+    upload(client, "/volumes/upload", ["V1", "V2"])
+    client.post("/lists/register", data={"name": "甲馆", "kind": "accept"})
+    client.post("/rules/save", data={"rule": '"甲馆"'})
+    upload(client, "/lists/1/upload", ["V1", "V2"])
+    client.post("/volumes/remove", data={"volume_no": "V2"})
+
+    # 离册期间重传名单，新名单不含 V2
+    upload(client, "/lists/1/upload", ["V1"])
+    client.post("/volumes/add", data={"volume_no": "V2"})
+    conn = svc._conn()
+    try:
+        vid = svc.current_version_id(conn)
+        verdicts = {r["volume_no"]: r["verdict"]
+                    for r in svc.result_page(conn, vid, None, 100, 0)}
+        assert verdicts == {"V1": "in", "V2": "out"}
+    finally:
+        conn.close()
+
+    # 再来一次：离册期间提交空名单，补回后同样落选
+    client.post("/volumes/remove", data={"volume_no": "V1"})
+    client.post("/lists/1/upload",
+                data={"file": (io.BytesIO(b""), "empty.txt")},
+                content_type="multipart/form-data")
+    client.post("/volumes/add", data={"volume_no": "V1"})
+    conn = svc._conn()
+    try:
+        vid = svc.current_version_id(conn)
+        verdicts = {r["volume_no"]: r["verdict"]
+                    for r in svc.result_page(conn, vid, None, 100, 0)}
+        assert verdicts == {"V1": "out", "V2": "out"}
+    finally:
+        conn.close()
+
+
+def test_offbook_withdraw_treated_as_missing_on_restore(client, svc):
+    """离册期间撤回名单：补回后该名单按缺报处理，卷号回到待补。"""
+    upload(client, "/volumes/upload", ["V1", "V2"])
+    client.post("/lists/register", data={"name": "甲馆", "kind": "accept"})
+    client.post("/rules/save", data={"rule": '"甲馆"'})
+    upload(client, "/lists/1/upload", ["V1", "V2"])
+    client.post("/volumes/remove", data={"volume_no": "V2"})
+    client.post("/lists/1/withdraw", follow_redirects=True)
+    client.post("/volumes/add", data={"volume_no": "V2"})
+    conn = svc._conn()
+    try:
+        vid = svc.current_version_id(conn)
+        verdicts = {r["volume_no"]: r["verdict"]
+                    for r in svc.result_page(conn, vid, None, 100, 0)}
+        assert verdicts["V2"] == "pending"  # 甲馆缺报，无法确定
+        row = svc.get_source(conn, 1)
+        assert row["status"] == "withdrawn"
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------- 旧库一次性补录
+
+def _mark_legacy(svc, extra_sql: str | None = None):
+    """把当前库伪装成旧版代码留下的库：打补丁录标记，并可模拟误删条目。"""
+    conn = svc._conn()
+    try:
+        conn.execute("DELETE FROM meta WHERE key = 'schema_level'")
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('legacy_backfill', 'pending')")
+        if extra_sql:
+            conn.execute(extra_sql)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_legacy_backfill_uses_published_in_volumes(client, svc):
+    upload(client, "/volumes/upload", ["V1", "V2", "V3", "V4"])
+    client.post("/lists/register", data={"name": "甲馆", "kind": "accept"})
+    # 规则恰好就是这份名单的名称（裸字符串）
+    client.post("/rules/save", data={"rule": '"甲馆"'})
+    upload(client, "/lists/1/upload", ["V1", "V2"])
+    # 旧库：换册误删了甲馆的全部条目
+    _mark_legacy(svc, "DELETE FROM list_entry WHERE list_id = 1")
+
+    summary = svc.replace_volumes(b"V1\nV2\nV3\nV4\n")
+    assert summary["backfilled"] == {"甲馆": 2}
+    conn = svc._conn()
+    try:
+        entries = {r["volume_no"] for r in conn.execute(
+            "SELECT volume_no FROM list_entry WHERE list_id = 1")}
+        assert entries == {"V1", "V2"}  # 用发布版的确定入选卷号补录
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key = 'legacy_backfill'").fetchone()[0] == "done"
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_level'").fetchone()[0] == "2"
+        vid = svc.current_version_id(conn)
+        verdicts = {r["volume_no"]: r["verdict"]
+                    for r in svc.result_page(conn, vid, None, 100, 0)}
+        assert verdicts["V1"] == "in" and verdicts["V2"] == "in"
+    finally:
+        conn.close()
+
+    # 补录只执行一次：再次换册不再出现补录
+    again = svc.replace_volumes(b"V1\nV2\nV3\nV4\n")
+    assert again["backfilled"] == {}
+
+
+def test_legacy_backfill_keeps_surviving_records(client, svc):
+    """INSERT OR IGNORE：只补缺失项，绝不覆盖库中幸存记录。"""
+    upload(client, "/volumes/upload", ["V1", "V2"])
+    client.post("/lists/register", data={"name": "甲馆", "kind": "accept"})
+    client.post("/rules/save", data={"rule": '"甲馆"'})
+    upload(client, "/lists/1/upload", ["V1", "V2"])
+    # 旧库只误删了 V2，V1 幸存
+    _mark_legacy(svc, "DELETE FROM list_entry WHERE list_id = 1 AND volume_no = 'V2'")
+    summary = svc.replace_volumes(b"V1\nV2\n")
+    assert summary["backfilled"] == {"甲馆": 1}
+    conn = svc._conn()
+    try:
+        assert {r["volume_no"] for r in conn.execute(
+            "SELECT volume_no FROM list_entry WHERE list_id = 1")} == {"V1", "V2"}
+    finally:
+        conn.close()
+
+
+def test_legacy_backfill_skipped_when_rule_not_plain_name(client, svc):
+    upload(client, "/volumes/upload", ["V1", "V2"])
+    client.post("/lists/register", data={"name": "甲馆", "kind": "accept"})
+    client.post("/rules/save", data={"rule": '{"并":["甲馆"]}'})
+    upload(client, "/lists/1/upload", ["V1"])
+    _mark_legacy(svc, "DELETE FROM list_entry WHERE list_id = 1")
+    summary = svc.replace_volumes(b"V1\nV2\n")
+    # 最近提交虽生成过版本，但规则不是裸名单名：沿用库中记录（仍为空）
+    assert summary["backfilled"] == {}
+    conn = svc._conn()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM list_entry").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key = 'legacy_backfill'").fetchone()[0] == "done"
+    finally:
+        conn.close()
+
+
+def test_legacy_backfill_skips_withdrawn_and_unreported(client, svc):
+    upload(client, "/volumes/upload", ["V1", "V2"])
+    client.post("/lists/register", data={"name": "甲馆", "kind": "accept"})
+    client.post("/lists/register", data={"name": "乙馆", "kind": "accept"})
+    client.post("/rules/save", data={"rule": '"甲馆"'})
+    upload(client, "/lists/1/upload", ["V1"])
+    # 甲馆撤回（不再是 reported）；乙馆从未提交
+    client.post("/lists/1/withdraw")
+    _mark_legacy(svc)
+    summary = svc.replace_volumes(b"V1\nV2\n")
+    assert summary["backfilled"] == {}  # 撤回/缺报名单一律不补录
+
+
+def test_legacy_backfill_failure_rolls_back_and_can_retry(client, svc):
+    upload(client, "/volumes/upload", ["V1", "V2"])
+    client.post("/lists/register", data={"name": "甲馆", "kind": "accept"})
+    client.post("/rules/save", data={"rule": '"甲馆"'})
+    upload(client, "/lists/1/upload", ["V1", "V2"])
+    _mark_legacy(svc, "DELETE FROM list_entry WHERE list_id = 1")
+    # 破坏规则文本，使同事务重算失败：整体回滚、标记保留
+    conn = svc._conn()
+    try:
+        conn.execute("UPDATE rule_doc SET doc = '{broken' WHERE id = 1")
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(Exception):
+        svc.replace_volumes(b"V1\nV2\n")
+    conn = svc._conn()
+    try:
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key = 'legacy_backfill'").fetchone()[0] == "pending"
+        assert conn.execute("SELECT COUNT(*) FROM list_entry").fetchone()[0] == 0
+        # 修复后重试成功，补录生效
+        conn.execute("UPDATE rule_doc SET doc = '\"甲馆\"' WHERE id = 1")
+        conn.commit()
+    finally:
+        conn.close()
+    summary = svc.replace_volumes(b"V1\nV2\n")
+    assert summary["backfilled"] == {"甲馆": 2}
+
+
+def test_fresh_db_has_no_legacy_backfill_mark(tmp_path):
+    svc = CatalogService(str(tmp_path / "fresh.db"))
+    conn = svc._conn()
+    try:
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_level'").fetchone()[0] == "2"
+        assert conn.execute(
+            "SELECT 1 FROM meta WHERE key = 'legacy_backfill'").fetchone() is None
+    finally:
+        conn.close()
+
+
+def test_legacy_db_reopen_before_backfill_keeps_single_pending_mark(tmp_path):
+    """旧库在首次非空换册（补录）完成前，应用重启不得报错、标记不重复。"""
+    db_path = str(tmp_path / "legacy.db")
+    svc = CatalogService(db_path)
+    svc.replace_volumes(b"V1\n")
+    svc.register_list("甲馆", "accept")
+    svc.save_rule('"甲馆"')
+    # 伪装成尚未补录的旧库
+    conn = svc._conn()
+    try:
+        conn.execute("DELETE FROM meta WHERE key = 'schema_level'")
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('legacy_backfill', 'pending')")
+        conn.commit()
+    finally:
+        conn.close()
+    # 重新打开（模拟重启）：不应抛唯一约束错误，标记仍只有一条 pending
+    svc2 = CatalogService(db_path)
+    conn = svc2._conn()
+    try:
+        rows = conn.execute(
+            "SELECT value FROM meta WHERE key = 'legacy_backfill'").fetchall()
+        assert len(rows) == 1 and rows[0][0] == "pending"
+    finally:
+        conn.close()
+
+
+def test_empty_replacement_does_not_trigger_legacy_backfill(client, svc):
+    upload(client, "/volumes/upload", ["V1", "V2"])
+    client.post("/lists/register", data={"name": "甲馆", "kind": "accept"})
+    client.post("/rules/save", data={"rule": '"甲馆"'})
+    upload(client, "/lists/1/upload", ["V1"])
+    _mark_legacy(svc, "DELETE FROM list_entry WHERE list_id = 1")
+    # 换成空总册：不触发补录，标记保持 pending
+    svc.replace_volumes(b"")
+    conn = svc._conn()
+    try:
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key = 'legacy_backfill'").fetchone()[0] == "pending"
+        assert conn.execute("SELECT COUNT(*) FROM list_entry").fetchone()[0] == 0
+    finally:
+        conn.close()
+    # 随后首次换成非空总册才补录
+    summary = svc.replace_volumes(b"V1\nV2\n")
+    assert summary["backfilled"] == {"甲馆": 1}

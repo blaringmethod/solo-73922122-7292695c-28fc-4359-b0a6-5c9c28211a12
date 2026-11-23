@@ -2,13 +2,30 @@
 
 表结构
 ------
-meta          单行键值（规则文档、当前版本号等）
+meta          单行键值（规则文档、当前版本号、schema_level / legacy_backfill 标记等）
 volume        总册卷号主数据
 list_source   名单来源（最多 14 个），含状态 missing/reported/withdrawn
-list_entry    已提交名单中的卷号条目
+list_entry    已提交名单中的卷号条目（含暂时离册但被保留的条目）
 rule_doc      规则 JSON 文本（单行）
 result_version 每次成功重算生成一个不可变版本
-result_item   版本下每个卷号的结论（in/out/pending）及相关缺报名单
+result_item   版本下每个在册卷号的结论（in/out/pending）及相关缺报名单
+
+离册保留语义（修复“移出再补回”错判）
+------------------------------------
+- 换册只改 volume 表，不再删除 list_entry：卷号离册期间其名单条目原样保留，
+  名单页“卷号数”只统计仍在总册内的条目，离册条目另行提示保留数量。
+- 卷号补回后按分馆“最近一次提交”的名单判定：离册期间重传过名单（含空名单）
+  就以新名单为准；撤回则条目清空、按缺报处理。
+- 每个新版本的 result_item 只覆盖在册卷号；历史版本不可变，CSV 永远按原样下载。
+
+旧库一次性补录
+--------------
+旧版代码会在换册时物理删除离册条目。旧库（无 schema_level 标记）首次成功换成
+非空总册时，在同一事务内为“仍处于已提交状态”的名单补录误删条目：
+- 该名单最近一次提交所生成的最新发布版，若当时规则文本恰好就是这份名单的名称，
+  用该版 result_item 中 verdict='in' 的卷号补录（INSERT OR IGNORE，不覆盖现存记录）；
+- 其余情况（无发布版、规则不是裸名单名等）沿用库中已有记录，不做改写。
+补录与换册、重算同生共死：失败整体回滚、标记保留，可原样重试。
 
 版本语义：重算在单个事务内完成，成功才写入新版本并切换“当前版本”；
 失败则整体回滚，网页与下载继续沿用上一版。旧版本永久保留、可随时下载。
@@ -28,6 +45,7 @@ from .logic import MAX_LISTS, RuleError, RuleEvaluator, parse_rule, referenced_n
 
 MAX_VOLUMES = 50_000
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024  # 单次上传 8 MiB 上限
+SCHEMA_LEVEL = "2"  # v2：换册保留离册名单条目；v1 旧库需要一次性补录
 VERDICTS = ("in", "out", "pending")
 VERDICT_LABELS = {"in": "确定入选", "out": "确定落选", "pending": "待补"}
 KINDS = ("scan", "accept", "hold")
@@ -106,7 +124,27 @@ def init_db(path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     conn = get_db(path)
     try:
+        # 先探测再建表：据此区分“全新库”与“由旧版代码创建的存量库”
+        had_objects = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1"
+        ).fetchone() is not None
         conn.executescript(SCHEMA)
+        if conn.execute(
+            "SELECT 1 FROM meta WHERE key = 'schema_level'"
+        ).fetchone() is None:
+            if had_objects:
+                # 旧库：旧版换册会物理删除离册条目，等待首次非空换册时补录。
+                # OR IGNORE：应用在补录完成前重启时保留既有 pending 标记，不重复插入。
+                conn.execute(
+                    "INSERT OR IGNORE INTO meta(key, value) "
+                    "VALUES ('legacy_backfill', 'pending')"
+                )
+            else:
+                # 全新库：离册条目本来就会保留，无需补录
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES ('schema_level', ?)",
+                    (SCHEMA_LEVEL,),
+                )
         conn.commit()
     finally:
         conn.close()
@@ -167,9 +205,16 @@ class CatalogService:
         ).fetchall()
 
     def list_sources(self, conn: sqlite3.Connection) -> list[sqlite3.Row]:
+        # n_entries 只统计仍在总册内的条目；n_retained 为离册期间保留、暂不计入的条目数
         return conn.execute(
-            "SELECT s.*, (SELECT COUNT(*) FROM list_entry e WHERE e.list_id = s.id) AS n_entries "
-            "FROM list_source s ORDER BY s.id"
+            "SELECT s.*, "
+            " COALESCE(SUM(CASE WHEN v.volume_no IS NOT NULL THEN 1 ELSE 0 END), 0) AS n_entries, "
+            " COUNT(e.volume_no) AS n_total_entries, "
+            " COALESCE(SUM(CASE WHEN v.volume_no IS NULL THEN 1 ELSE 0 END), 0) AS n_retained "
+            "FROM list_source s "
+            "LEFT JOIN list_entry e ON e.list_id = s.id "
+            "LEFT JOIN volume v ON v.volume_no = e.volume_no "
+            "GROUP BY s.id ORDER BY s.id"
         ).fetchall()
 
     def get_source(self, conn: sqlite3.Connection, list_id: int) -> sqlite3.Row | None:
@@ -193,30 +238,148 @@ class CatalogService:
 
     # ---- 总册卷号 -------------------------------------------------------
 
+    def _submit_reason(self, name: str) -> str:
+        """与 upload_list 写入 result_version.reason 的文案保持一致。"""
+        return f"名单《{name}》提交"
+
     def replace_volumes(self, raw: bytes) -> dict:
         volumes = parse_volume_text(raw)
         if len(volumes) > MAX_VOLUMES:
             raise ServiceError(f"总册卷号数量 {len(volumes)} 超过上限 {MAX_VOLUMES}")
+        return self._apply_volumes(volumes, reason="总册卷号更新")
+
+    def remove_volume(self, volume_no: str) -> dict:
+        """把单个卷号移出总册（演示“移出”场景）；名单条目原样保留。"""
+        volume_no = (volume_no or "").strip()
+        if not volume_no:
+            raise ServiceError("卷号不能为空")
         with self._lock:
             conn = self._conn()
             try:
-                conn.execute("DELETE FROM volume")
-                conn.executemany(
-                    "INSERT INTO volume(volume_no) VALUES (?)", [(v,) for v in volumes]
-                )
-                # 清理名单条目中已不在总册内的悬空卷号，随后同事务重算
-                conn.execute(
-                    "DELETE FROM list_entry WHERE volume_no NOT IN "
-                    "(SELECT volume_no FROM volume)"
-                )
-                summary = self._recompute(conn, reason="总册卷号更新")
+                if conn.execute(
+                    "SELECT 1 FROM volume WHERE volume_no = ?", (volume_no,)
+                ).fetchone() is None:
+                    raise ServiceError(f"卷号 {volume_no} 不在总册内，无法移出")
+                volumes = [r["volume_no"] for r in conn.execute(
+                    "SELECT volume_no FROM volume WHERE volume_no <> ? ORDER BY id",
+                    (volume_no,))]
+                summary = self._apply_volumes_in_tx(
+                    conn, volumes, reason=f"卷号 {volume_no} 移出总册")
                 conn.commit()
-                return {"count": len(volumes), **summary}
+                return summary
             except Exception:
                 conn.rollback()
                 raise
             finally:
                 conn.close()
+
+    def add_volume(self, volume_no: str) -> dict:
+        """把单个卷号补回总册（演示“补回”场景）；按分馆最近一次提交的名单判定。"""
+        volume_no = (volume_no or "").strip()
+        if not volume_no:
+            raise ServiceError("卷号不能为空")
+        with self._lock:
+            conn = self._conn()
+            try:
+                if conn.execute(
+                    "SELECT 1 FROM volume WHERE volume_no = ?", (volume_no,)
+                ).fetchone() is not None:
+                    raise ServiceError(f"卷号 {volume_no} 已在总册内，无需补回")
+                if self.volume_count(conn) >= MAX_VOLUMES:
+                    raise ServiceError(f"总册卷号数量已达上限 {MAX_VOLUMES}")
+                volumes = [r["volume_no"] for r in conn.execute(
+                    "SELECT volume_no FROM volume ORDER BY id")]
+                volumes.append(volume_no)
+                summary = self._apply_volumes_in_tx(
+                    conn, volumes, reason=f"卷号 {volume_no} 补回总册")
+                conn.commit()
+                return summary
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def _apply_volumes(self, volumes: list[str], reason: str) -> dict:
+        """整册替换：加锁、开事务，失败整体回滚并可重试。"""
+        with self._lock:
+            conn = self._conn()
+            try:
+                summary = self._apply_volumes_in_tx(conn, volumes, reason)
+                conn.commit()
+                summary["count"] = len(volumes)
+                return summary
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def _apply_volumes_in_tx(self, conn: sqlite3.Connection,
+                             volumes: list[str], reason: str) -> dict:
+        """调用方已持锁/事务。换册、旧库补录、重算在同一事务内一起生效。"""
+        conn.execute("DELETE FROM volume")
+        conn.executemany(
+            "INSERT INTO volume(volume_no) VALUES (?)", [(v,) for v in volumes]
+        )
+        # 注意：不再删除 list_entry。离册卷号的名单条目保留，补回后仍按
+        # 分馆最近一次提交的名单判定；名单页统计与新版本只认在册卷号。
+        backfilled: dict[str, int] = {}
+        if volumes and conn.execute(
+            "SELECT 1 FROM meta WHERE key = 'legacy_backfill' AND value = 'pending'"
+        ).fetchone() is not None:
+            backfilled = self._backfill_legacy_entries(conn)
+            conn.execute(
+                "UPDATE meta SET value = 'done' WHERE key = 'legacy_backfill'"
+            )
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('schema_level', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (SCHEMA_LEVEL,),
+            )
+        summary = self._recompute(conn, reason=reason)
+        summary["backfilled"] = backfilled
+        return summary
+
+    def _backfill_legacy_entries(self, conn: sqlite3.Connection) -> dict[str, int]:
+        """旧库首次换成非空总册时，为仍处于已提交状态的名单补录误删条目。
+
+        规则（按需求逐条落实）：
+        - 只处理 status='reported' 的名单；missing/withdrawn 一律跳过。
+        - 取该名单“最近一次提交”生成过的最新发布版（reason 为《名单》提交），
+          且该版 rule_snapshot 规范化后恰好就是这份名单的名称——满足时用该版
+          所有 verdict='in' 的卷号补录；其余情况沿用库中已有记录，不改写。
+        - 只补不删、不覆盖现存条目（INSERT OR IGNORE）。
+        返回 {名单名: 实际补录条数}。
+        """
+        backfilled: dict[str, int] = {}
+        for src in self.list_sources(conn):
+            if src["status"] != "reported":
+                continue
+            name = src["name"]
+            version = conn.execute(
+                "SELECT * FROM result_version WHERE reason = ? ORDER BY id DESC LIMIT 1",
+                (self._submit_reason(name),),
+            ).fetchone()
+            if version is None:
+                continue  # 最近一次提交没有生成过发布版：沿用库中记录
+            try:
+                rule_is_plain_name = (
+                    json.loads(version["rule_snapshot"]) == name
+                )
+            except (json.JSONDecodeError, TypeError):
+                rule_is_plain_name = False
+            if not rule_is_plain_name:
+                continue  # 当时收录规则不是这份名单的裸名称：沿用库中记录
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO list_entry(list_id, volume_no) "
+                "SELECT ?, volume_no FROM result_item "
+                "WHERE version_id = ? AND verdict = 'in'",
+                (src["id"], version["id"]),
+            )
+            if cur.rowcount:
+                backfilled[name] = cur.rowcount
+        return backfilled
 
     # ---- 名单来源登记 ---------------------------------------------------
 
@@ -373,8 +536,12 @@ class CatalogService:
             bit = reported_bits.get(r["name"])
             if bit is None:
                 continue
+            # 只取在册卷号的条目：离册保留条目不参与本版判定，
+            # result_item 也只覆盖在册卷号（历史版本仍原样保留）。
             rows = conn.execute(
-                "SELECT volume_no FROM list_entry WHERE list_id = ?", (r["id"],)
+                "SELECT e.volume_no FROM list_entry e "
+                "JOIN volume v ON v.volume_no = e.volume_no "
+                "WHERE e.list_id = ?", (r["id"],)
             ).fetchall()
             for x in rows:
                 vol = x["volume_no"]

@@ -21,7 +21,7 @@
       <td>{{ r.name }}</td>
       <td>{{ kind_labels[r.kind] }}</td>
       <td><span class="badge st-{{ r.status }}">{{ status_labels[r.status] }}</span></td>
-      <td>{{ r.n_entries }}</td>
+      <td>{{ r.n_entries }}{% if r.n_retained %}<span class="hint">（另有 {{ r.n_retained }} 个离册保留条目）</span>{% endif %}</td>
       <td>
         <form method="post" action="{{ url_for('lists_upload', list_id=r.id) }}" enctype="multipart/form-data" class="inline">
           <input type="file" name="file" accept=".txt,.csv" required>
@@ -42,4 +42,5 @@
 </table>
 {% else %}<p class="empty">尚未登记名单来源。</p>{% endif %}
 <p class="hint">上传空文件（0 字节或仅空白行）表示该名单已提交但不含任何卷号；这与“缺报”不同。</p>
+<p class="hint">“卷号数”只统计仍在总册内的卷号；卷号离册期间其名单条目原样保留（不计入统计、不参与判定），补回后按本名单最近一次提交的内容判定。</p>
 {% endblock %}

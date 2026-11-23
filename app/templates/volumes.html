@@ -6,13 +6,28 @@
   <button class="btn primary" type="submit">上传并替换总册</button>
   <span class="hint">每行一个卷号，也支持单列 CSV；上传后立即重算。空文件表示总册为空。</span>
 </form>
+<form class="upload" method="post" action="{{ url_for('volumes_add') }}">
+  <input type="text" name="volume_no" placeholder="输入要补回的卷号，如 V2" required>
+  <button class="btn primary" type="submit">补回卷号</button>
+  <span class="hint">把曾移出的卷号补回总册；按分馆最近一次提交的名单判定（离册期间重传过就以新名单为准，空名单同理，撤回按缺报）。</span>
+</form>
 
 {% if rows %}
 <table>
-  <thead><tr><th>#</th><th>卷号</th></tr></thead>
+  <thead><tr><th>#</th><th>卷号</th><th>操作</th></tr></thead>
   <tbody>
   {% for r in rows %}
-    <tr><td>{{ (page - 1) * 100 + loop.index }}</td><td>{{ r.volume_no }}</td></tr>
+    <tr>
+      <td>{{ (page - 1) * 100 + loop.index }}</td>
+      <td>{{ r.volume_no }}</td>
+      <td>
+        <form method="post" action="{{ url_for('volumes_remove') }}" class="inline"
+              onsubmit="return confirm('移出后该卷号不再参与判定与发布，但分馆名单条目会原样保留，确定？');">
+          <input type="hidden" name="volume_no" value="{{ r.volume_no }}">
+          <button class="btn small danger" type="submit">移出总册</button>
+        </form>
+      </td>
+    </tr>
   {% endfor %}
   </tbody>
 </table>
@@ -21,5 +36,6 @@
   <span>第 {{ page }} / {{ pages }} 页</span>
   {% if page < pages %}<a href="{{ url_for('volumes', page=page+1) }}">下一页</a>{% endif %}
 </div>
-{% else %}<p class="empty">暂无卷号，请上传总册文件。</p>{% endif %}
+{% else %}<p class="empty">暂无卷号，请上传总册文件，或在上方输入卷号补回。</p>{% endif %}
+<p class="hint">移出卷号不会删除任何分馆名单条目；名单页的“卷号数”只统计在册卷号，离册保留的条目数会单独提示。</p>
 {% endblock %}
